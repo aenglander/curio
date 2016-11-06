@@ -19,6 +19,7 @@ from .errors import *
 from .errors import _CancelRetry
 from .task import Task
 from .traps import _read_wait, Traps
+from .tls import _enable_tls_for, _copy_tls
 
 # kqueue is the datatype used by the kernel for all of its queuing functionality.
 # Any time a task queue is needed, use this type instead of directly hard-coding the
@@ -187,9 +188,10 @@ class Kernel(object):
         # Initialize the loopback socket and launch the kernel task if needed
         def _init_loopback_task():
             self._init_loopback()
-            task = Task(_kernel_task(), taskid=0)
+            task = Task(_kernel_task(), taskid=0, daemon=True)
             _reschedule_task(task)
             self._kernel_task_id = task.id
+            self._tasks[task.id] = task
 
         # Internal task that monitors the loopback socket--allowing the kernel to
         # awake for non-I/O events.  Also processes incoming signals.  This only
@@ -258,7 +260,7 @@ class Kernel(object):
         # and continue to run to perform cleanup actions.  However, it would
         # normally terminate shortly afterwards.   This method is also used to
         # raise timeouts.
-        def _cancel_task(task, exc=CancelledError):
+        def _cancel_task(task, exc=CancelledError, val=None):
             if task.terminated:
                 return True
 
@@ -285,7 +287,7 @@ class Kernel(object):
             task.cancel_func()
 
             # Reschedule it with a pending exception
-            _reschedule_task(task, exc=exc(exc.__name__))
+            _reschedule_task(task, exc=exc(exc.__name__ if val is None else val))
             return True
 
         # Cleanup task.  This is called after the underlying coroutine has
@@ -308,30 +310,39 @@ class Kernel(object):
 
             del tasks[task.id]
 
-        # Shut down the kernel, cleaning up resources and cancelling
-        # still-running daemon tasks
+        # For "reasons" related to task scheduling, the task
+        # of shutting down all remaining tasks is best managed
+        # by a launching a task dedicated to carrying out the task (sic)
+        async def _shutdown_tasks(tocancel):
+            for task in tocancel:
+                try:
+                    await task.cancel()
+                except Exception as e:
+                    log.error('Exception %r ignored in curio shutdown' % e, exc_info=True)
+
+
+        # Shut down the kernel. All remaining tasks are run through a cancellation
+        # process so that they can cleanup properly.  After that, internal
+        # resources are cleaned up.
         def _shutdown():
             nonlocal njobs
-            for task in sorted(tasks.values(), key=lambda t: t.id, reverse=True):
-                if task.id == self._kernel_task_id:
-                    continue
+            tocancel = [task for task in tasks.values() if task.id != self._kernel_task_id]
 
-                # If the task is daemonic, force it to non-daemon status and cancel it
-                if task.daemon:
-                    njobs += 1
-                    task.daemon = False
+            # Cancel all non-daemonic tasks first
+            tocancel.sort(key=lambda task: task.daemon)
 
-                assert _cancel_task(task)
+            # Cancel the kernel loopback task last
+            if self._kernel_task_id is not None:
+                tocancel.append(tasks[self._kernel_task_id])
 
-            # Run all of the daemon tasks through cancellation
-            if ready:
+            if tocancel:
+                _new_task(_shutdown_tasks(tocancel))
                 self.run()
 
-            # Cancel the kernel loopback task (if any)
-            task = tasks.pop(self._kernel_task_id, None)
-            if task:
-                task.cancel_func()
-                self._kernel_task_id = None
+            self._kernel_task_id = None
+
+            # There had better not be any tasks left
+            assert not tasks
 
             # Cleanup other resources
             self._shutdown_resources()
@@ -405,14 +416,24 @@ class Kernel(object):
         # Add a new task to the kernel
         def _trap_spawn(_, coro, daemon):
             task = _new_task(coro, daemon)
+            _copy_tls(current, task)
             _reschedule_task(current, value=task)
 
         # Reschedule one or more tasks from a queue
-        def _trap_reschedule_tasks(_, queue, n, value, exc):
+        def _trap_reschedule_tasks(_, queue, n):
             while n > 0:
-                _reschedule_task(queue.popleft(), value=value, exc=exc)
+                _reschedule_task(queue.popleft())
                 n -= 1
             _reschedule_task(current)
+
+        # Trap that returns a function for rescheduling tasks from synchronous code
+        def _trap_queue_reschedule_function(_, queue):
+            def _reschedule(n):
+                while n > 0:
+                    _reschedule_task(queue.popleft())
+                    n -= 1
+            ready_appendleft(current)
+            current.next_value = _reschedule
 
         # Join with a task
         def _trap_join_task(_, task):
@@ -574,7 +595,7 @@ class Kernel(object):
                                     _reschedule_task(task, value=current_time)
                             else:
                                 if tm == task.timeout:
-                                    if (_cancel_task(task, exc=TaskTimeout)):
+                                    if (_cancel_task(task, exc=TaskTimeout, val=current_time)):
                                         task.timeout = None
                                     else:
                                         # Note: There is a possibility that a task will be
@@ -597,22 +618,20 @@ class Kernel(object):
                 try:
                     current.state = 'RUNNING'
                     current.cycles += 1
-                    if current.next_exc is None:
-                        trap = current._send(current.next_value)
-                    else:
-                        trap = current._throw(current.next_exc)
-                        current.next_exc = None
-
-                    # Execute the trap
-                    traps[trap[0]](*trap)
+                    with _enable_tls_for(current):
+                        if current.next_exc is None:
+                            trap = current._send(current.next_value)
+                        else:
+                            trap = current._throw(current.next_exc)
+                            current.next_exc = None
 
                 except StopIteration as e:
                     _cleanup_task(current, value=e.value)
 
-                except CancelledError as e:
+                except (CancelledError, TaskExit) as e:
                     current.exc_info = sys.exc_info()
                     current.state = 'CANCELLED'
-                    _cleanup_task(current)
+                    _cleanup_task(current, exc=e)
 
                 except Exception as e:
                     current.exc_info = sys.exc_info()
@@ -630,9 +649,13 @@ class Kernel(object):
                         import pdb as _pdb
                         _pdb.post_mortem(current.exc_info[2])
 
-                except (SystemExit, KeyboardInterrupt):
+                except: # (SystemExit, KeyboardInterrupt):
                     _cleanup_task(current)
                     raise
+
+                else:
+                    # Execute the trap
+                    traps[trap[0]](*trap)
 
                 finally:
                     # Unregister previous I/O request. Discussion follows:

@@ -1,6 +1,186 @@
 CHANGES
 -------
-07/22/2017 Added support for asynchronous access to files as might be
+10/29/2016 If the sendall() method of a socket is aborted with a CancelledError,
+           the resulting exception object now gets a bytes_sent attribute set to
+           indicate how much progress was made.   For example:
+
+           try:
+               await sock.sendall(data)
+           except CancelledError as e:
+               print(e.bytes_sent, 'bytes sent')
+
+10/29/2016 Added timeout_at() and ignore_at() functions that allow timeouts
+           to be specified at absolute clock values.  The usage is the
+           same as for timeout_after() and ignore_after().
+           
+10/29/2016 Modified TaskTimout exception so that it subclasses CancelledError.
+           This makes it easier to write code that handles any kind of 
+	   cancellation (explicit cancellation, cancellation by timeout, etc.)
+
+10/17/2016 Added shutdown() method to sockets.  It is an async function
+           to mirror async implementation of close()
+
+           await sock.shutdown(how)
+
+10/17/2016 Added writeable() method to sockets.  It can be used to
+           quickly test if a socket will accept more data before
+           doing a send().  See Issue #83.
+
+           await sock.writeable()
+           nsent = await sock.send(data)
+
+10/17/2016 More precisely defined the semantics of nested timeouts
+           and exception handling.  Consider the following arrangement
+           of timeout blocks:
+
+           # B1
+           async with timeout_after(time1):
+                # B2
+                async with timeout_after(time2):
+                    await coro()
+
+           Here are the rules:
+
+           1. If time2 expires before time1, then block B2 receives
+              a TaskTimeout exception.
+
+           2. If time1 expires before time2, then block B2 receives
+              a TimeoutCancellationError exception and block B1
+              receives a TaskTimeout exception.  This reflects the
+              fact that the inner timeout didn't actually occur
+              and thus it shouldn't be reported as such.  The inner
+              block is still cancelled however in order to satisfy
+              the outer timeout.
+
+           3. If time2 expires before time1 and the resulting
+              TaskTimeout is NOT caught, but allowed to propagate out
+              to B1, then block B1 receives an UncaughtTimeoutError
+              exception.  A block should never report a TaskTimeout
+              unless its specified time interval has actually expired.
+              Reporting a timeout early because of an uncaught 
+              exception in an inner block should be considered to be
+              an operational error. This exception reflects that.
+
+           4. If time1 and time2 both expire simultaneously, the
+              outer timeout takes precedence and time1 is considered
+              to have expired first.
+
+           See Issue #82 for further details about the rationale for
+           this change. https://github.com/dabeaz/curio/issues/82
+           
+           
+08/16/2016 Modified the Queue class so that the put() method can be used from either
+           synchronous or asynchronous code.  For example:
+
+              from curio import Queue
+              queue = Queue()
+
+              def spam():
+                  # Create some item
+                  ...
+                  queue.put(item)
+
+              async def consumer():
+                  while True:
+                       item = await queue.get()
+                       # Consume the item
+                       ...
+
+              async def coro():
+                    ...
+                    spam()       # Note: Normal synchronous function call
+                    ...
+
+              async def main():
+                  await spawn(coro())
+                  await spawn(consumer())
+
+              run(main())
+
+           The main purpose of adding this is to make it easier for normal
+           synchronous code to communicate to async tasks without knowing
+           too much about what they are.  Note:  The put() method is never
+           allowed to block in synchronous mode.  If the queue has a bounded
+           size and it fills up, an exception is raised.
+
+08/16/2016 Modified the Event class so that events can also be set from synchronous
+           code.  For example:
+
+               from curio import Event
+               evt = Event()
+
+               async def coro():
+                   print('Waiting for something')
+                   await evt.wait()
+                   print('It happened')
+
+               # A normal synchronous function. No async/await here.
+               def spam():
+                   print('About to signal')
+                   evt.set()
+
+               async def main():
+                   await spawn(coro())
+                   await sleep(5)
+                   spam()         # Note: Normal synchronous function call
+
+               run(main())
+
+           The main motivation for adding this is that is very easy for
+           control flow to escape the world of "async/await".  However,
+           that code may still want to signal or coordinate with async
+           tasks in some way.   By allowing a synchronous set(), it
+           makes it possible to do this.    It should be noted that within
+           a coroutine, you have to use await when triggering an event.
+           For example:
+
+               evt = Event()
+
+               def foo():
+                   evt.set()           # Synchronous use
+
+               async def bar():
+                   await evt.set()     # Asynchronous use
+
+08/04/2016 Added a new KernelExit exception that can be used to 
+           make the kernel terminate execution.  For example:
+
+              async def coro():
+                  ...
+                  if something_bad:
+                      raise KernelExit('Something bad')
+
+           This causes the kernel to simply stop, aborting the
+           currently executing task.   The exception will propagate
+           out of the run() function so if you need to catch it, do
+           this:
+
+               try:
+                   run(coro())
+               except KernelExit as e:
+                   print('Going away because of:', e)
+
+           KernelExit by itself does not do anything to other 
+	   running tasks.  However, the run() function will
+           separately issue a shutdown request causing all
+           remaining tasks to cancel.
+
+08/04/2016 Added a new TaskExit exception that can be used to make a 
+           single task terminate.  For example:
+
+               async def coro():
+                   ...
+                   if something_bad:
+                       raise TaskExit('Goodbye')
+                   ...
+
+           Think of TaskExit as a kind of self-cancellation. 
+
+08/04/2016 Some refinements to kernel shutdown.   The shutdown process is
+           more carefully supervised and fixes a few very subtle errors
+           related to task scheduling. 
+
+07/22/2016 Added support for asynchronous access to files as might be
            opened by the builtin open() function.  Use the new aopen()
            function with an async-context manager like this:
 

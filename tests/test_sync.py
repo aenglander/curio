@@ -70,7 +70,6 @@ class TestEvent:
                 'wait_done',
                 ]
 
-
     def test_event_wait_cancel(self, kernel):
         results = []
         async def event_waiter(evt):
@@ -160,6 +159,73 @@ class TestEvent:
                 'got event',
                 'event_set',
                 'got event'
+                ]
+
+class TestSyncEvent:
+    def test_syncevent_get_wait(self, kernel):
+        results = []
+
+        def evt_set(evt):
+            evt.set()
+
+        async def event_setter(evt, seconds):
+              results.append('sleep')
+              await sleep(seconds)
+              results.append('event_set')
+              evt_set(evt)
+
+        async def event_waiter(evt):
+              results.append('wait_start')
+              results.append(evt.is_set())
+              await evt.wait()
+              results.append('wait_done')
+              results.append(evt.is_set())
+              evt.clear()
+              results.append(evt.is_set())
+
+        async def main():
+            evt = Event()
+            await spawn(event_waiter(evt))
+            await spawn(event_setter(evt, 1))
+
+        kernel.run(main())
+        assert results == [
+                'wait_start',
+                False,
+                'sleep',
+                'event_set',
+                'wait_done',
+                True,
+                False
+                ]
+
+    def test_syncevent_get_immediate(self, kernel):
+        results = []
+        def evt_set(evt):
+            evt.set()
+
+        async def event_setter(evt):
+              results.append('event_set')
+              evt_set(evt)
+
+        async def event_waiter(evt, seconds):
+              results.append('sleep')
+              await sleep(seconds)
+              results.append('wait_start')
+              await evt.wait()
+              results.append('wait_done')
+
+        async def main():
+            evt = Event()
+            await spawn(event_waiter(evt, 1))
+            await spawn(event_setter(evt))
+
+        kernel.run(main())
+        assert results == [
+                'sleep',
+                'event_set',
+                'wait_start',
+                'wait_done',
                 ]
 
 class TestLock:
@@ -252,6 +318,60 @@ class TestLock:
                 'lock_timeout',
                 'sleep_done',
                 ]
+
+
+class TestRLock:
+    def test_rlock_reenter(self, kernel):
+        results = []
+
+        async def inner(lck, label):
+            results.append(lck.locked())
+            async with lck:
+                results.append(label + ' inner acquired')
+                results.append(label + ' inner releasing')
+
+        async def worker(lck, label):
+            results.append(lck.locked())
+            results.append(label + ' wait')
+            async with lck:
+                results.append(label + ' acquired')
+                await sleep(0.25)
+                await inner(lck, label)
+                results.append(label + ' releasing')
+
+        async def worker_simple(lck):
+            results.append('simple wait')
+            async with lck:
+                results.append('simple acquired')
+                results.append('simple releasing')
+
+        async def main():
+            lck = RLock()
+            await spawn(worker(lck, 'work1'))
+            await spawn(worker(lck, 'work2'))
+            await spawn(worker_simple(lck))
+
+        kernel.run(main())
+        assert results == [
+            False,
+            'work1 wait',
+            'work1 acquired',
+            True,
+            'work2 wait',
+            'simple wait',
+            True,
+            'work1 inner acquired',
+            'work1 inner releasing',
+            'work1 releasing',
+            'work2 acquired',
+            True,
+            'work2 inner acquired',
+            'work2 inner releasing',
+            'work2 releasing',
+            'simple acquired',
+            'simple releasing'
+        ]
+
 
 class TestSemaphore:
     def test_sema_sequence(self, kernel):

@@ -168,6 +168,25 @@ The following public attributes are available of :class:`Task` instances:
 
    A boolean flag that indicates whether or not the task has run to completion.
 
+Task local storage
+------------------
+
+Curio supports "task local storage". The API is modeled after the
+"thread local storage" provided by :py:class:`threading.local`.
+
+.. class:: Local
+
+   A class representing a bundle of task-local values. Objects of this
+   class have no particular attributes or methods. Instead, they serve
+   as a blank slate to which you can add whatever attributes you
+   like. Modifications made from within one task will only be visible
+   to that task -- with one exception: when you create a new task
+   using ``curio.spawn``, then any values assigned to
+   :py:class:`Local` objects in the parent task will be inherited by
+   the child. This inheritance takes the form of a shallow copy --
+   further changes in the parent won't affect the child, and further
+   changes in the child won't affect the parent.
+
 Timeouts
 --------
 Any blocking operation in curio can be cancelled after a timeout.  The following
@@ -182,6 +201,14 @@ functions can be used for this purpose:
    function serves as an asynchronous context manager that applies a
    timeout to a block of statements.
 
+   :func:`timeout_after` may be composed with other :func:`timeout_after` 
+   operations (i.e., nested timeouts).   If an outer timeout expires
+   first, then ``curio.TimeoutCancellationError`` is raised
+   instead of :py:exc:`curio.TaskTimeout`.  If an inner timeout
+   expires and fails to properly catch :py:exc:`curio.TaskTimeout`,
+   a ``curio.UncaughtTimeoutError`` is raised in the outer
+   timeout.  
+
 .. asyncfunction:: ignore_after(seconds, coro=None, *, timeout_result=None)
 
    Execute the specified coroutine and return its result. Issue a
@@ -192,6 +219,11 @@ functions can be used for this purpose:
    of statements.  For the context manager case, ``result`` attribute
    of the manager is set to ``None`` or the value of *timeout_result*
    if the block was cancelled.
+
+   Note: :func:`ignore_after` may also be composed with other timeout
+   operations.  ``curio.TimeoutCancellationError`` and
+   ``curio.UncaughtTimeoutError`` exceptions might be raised
+   according to the same rules as for :func:`timeout_after`.
 
 Here is an example that shows how these functions can be used::
 
@@ -876,6 +908,31 @@ The preferred way to use a Lock is as an asynchronous context manager. For examp
 
     curio.run(main())
 
+.. class:: RLock()
+
+   This class provides a recursive lock funtionality, that could be acquired multiple times
+   within the same task. The behavior of this lock is identical to the ``threading.RLock``,
+   except that the owner of the lock will be a task, wich acquired it, instead of a thread.
+
+
+:class:`RLock` instances support the following methods:
+
+.. asyncmethod:: Lock.acquire()
+
+   Acquire the lock, incrementing the recursion by 1. Can be used multiple times withing 
+   the same task, that owns this lock.
+
+.. asyncmethod:: Lock.release()
+
+   Release the lock, decrementing the rerecurtion level by 1. If recursion level reaches 0,
+   the lock is unlocked. Raises ``RuntimeError`` if called not by the owner or if lock
+   is not locked.
+
+.. method:: Lock.locked()
+
+   Return ``True`` if the lock is currently held, i.e. recursion level is greater than 0.
+
+
 .. class:: Semaphore(value=1)
 
    Create a semaphore.  Semaphores are based on a counter.  If the count is greater
@@ -1055,6 +1112,61 @@ Here is an example of using queues in a producer-consumer problem::
         await cons_task.cancel()
 
     curio.run(main())
+
+.. class:: PriorityQueue(maxsize=0)
+
+  Creates a **priority** queue with a maximum number of elements in *maxsize*.
+
+In a :class:`PriorityQueue` items are retrieved in priority order with the 
+lowest priority first::
+
+    import curio
+
+    async def main():
+        q = curio.PriorityQueue()
+        await q.put((0, 'highest priority'))
+        await q.put((100, 'very low priority'))
+        await q.put((3, 'higher priority'))
+
+        while not q.empty():
+            print(await q.get())
+
+    curio.run(main())
+
+
+This will output
+::
+
+    (0, 'highest priority')
+    (3, 'higher priority')
+    (100, 'very low priority')
+
+.. class:: LifoQueue(maxsize=0)
+
+    A queue with **"Last In First Out"** retrieving policy
+
+::
+
+    import curio
+
+    async def main():
+        q = curio.LifoQueue()
+        await q.put('first')
+        await q.put('second')
+        await q.put('last')
+
+        while not q.empty():
+            print(await q.get())
+
+    curio.run(main())
+
+This will output
+::
+
+    last
+    second
+    first
+
 
 Synchronizing with Threads and Processes
 ----------------------------------------

@@ -28,11 +28,13 @@
 __all__ = ['Socket', 'FileStream', 'SocketStream']
 
 from socket import SOL_SOCKET, SO_ERROR
+from select import select
 from contextlib import contextmanager
 import io
 import os
 
 from .traps import _read_wait, _write_wait
+from . import errors
 
 # Exceptions raised for non-blocking I/O.  For normal sockets, blocking operations
 # normally just raise BlockingIOError.  For SSL sockets, more specific exceptions
@@ -135,14 +137,24 @@ class Socket(object):
 
     async def sendall(self, data, flags=0):
         buffer = memoryview(data).cast('b')
-        while buffer:
-            try:
-                nsent = self._socket_send(buffer, flags)
-                buffer = buffer[nsent:]
-            except WantWrite:
-                await _write_wait(self._fileno)
-            except WantRead:
-                await _read_wait(self._fileno)
+        total_sent = 0
+        try:
+            while buffer:
+                try:
+                    nsent = self._socket_send(buffer, flags)
+                    total_sent += nsent
+                    buffer = buffer[nsent:]
+                except WantWrite:
+                    await _write_wait(self._fileno)
+                except WantRead:
+                    await _read_wait(self._fileno)
+        except errors.CancelledError as e:
+            e.bytes_sent = total_sent
+            raise
+
+    async def writeable(self):
+        if not select([], [self._fileno], [], 0)[1]:
+            await _write_wait(self._fileno)
 
     async def accept(self):
         while True:
@@ -248,6 +260,10 @@ class Socket(object):
         self._socket = None
         self._fileno = -1
 
+    # This is declared as async for the same reason as close()
+    async def shutdown(self, how):
+        self._socket.shutdown(how)
+        
     async def __aenter__(self):
         self._socket.__enter__()
         return self

@@ -4,24 +4,25 @@
 # events, locks, semaphores, and condition variables. These primitives
 # are only safe to use in the curio framework--they are not thread safe.
 
-__all__ = ['Event', 'Lock', 'Semaphore', 'BoundedSemaphore', 'Condition', 'abide' ]
+__all__ = ['Event', 'Lock', 'RLock', 'Semaphore', 'BoundedSemaphore', 'Condition', 'abide' ]
 
 import threading
 from inspect import iscoroutinefunction
 
-from .traps import _wait_on_queue, _reschedule_tasks, _future_wait
+from .traps import _wait_on_queue, _reschedule_tasks, _future_wait, _queue_reschedule_function
 from .kernel import kqueue
 from . import workers
 from .errors import CancelledError, TaskTimeout
-from .task import spawn
+from .task import spawn, current_task
+from .meta import awaitable
 
 class Event(object):
-
-    __slots__ = ('_set', '_waiting')
+    __slots__ = ('_set', '_waiting', '_reschedule_func')
 
     def __init__(self):
         self._set = False
         self._waiting = kqueue()
+        self._reschedule_func = None
 
     def __repr__(self):
         res = super().__repr__()
@@ -37,12 +38,44 @@ class Event(object):
     async def wait(self):
         if self._set:
             return
+
+        if self._reschedule_func is None:
+            self._reschedule_func = await _queue_reschedule_function(self._waiting)
+
         await _wait_on_queue(self._waiting, 'EVENT_WAIT')
 
+    def set(self):
+        self._set = True
+        if self._reschedule_func and self._waiting:
+            self._reschedule_func(len(self._waiting))
+
+    @awaitable(set)
     async def set(self):
         self._set = True
         await _reschedule_tasks(self._waiting, len(self._waiting))
 
+class SyncEvent(Event):
+    '''
+    An Event object that can only be awaited in asynchronous code, set
+    in synchronous code.   Useful for coordinating asynchronous tasks
+    from normal synchronous code.
+    '''
+    __slots__ = ('_reschedule_func',)
+
+    def __init__(self):
+        super().__init__()
+        self._reschedule_func = None
+
+    async def wait(self):
+        if self._reschedule_func is None:
+            self._reschedule_func = await _queue_reschedule_function(self._waiting)
+        await super().wait()
+
+    def set(self):
+        self._set = True
+        if self._reschedule_func:
+            self._reschedule_func(len(self._waiting))
+        
 class _LockBase(object):
 
     async def __aenter__(self):
@@ -86,6 +119,60 @@ class Lock(_LockBase):
 
     def locked(self):
         return self._acquired
+
+
+class RLock(_LockBase):
+
+    __slots__ = ('_lock', '_owner', '_count')
+
+    def __init__(self):
+        self._lock = Lock()
+        self._owner = None
+        self._count = 0
+
+    async def acquire(self):
+
+        me = await current_task()
+
+        if self._owner is not me:
+
+            await self._lock.acquire()
+            self._owner = me
+        self._count += 1
+        return True
+
+    async def release(self):
+        """Release the lock
+
+        If the acquisitions count reaches 0, release the underlying
+        lock. Only the owner of the lock can release it.
+
+        Note, that due to the asynchronous nature of the _LocBase.__aexit__(),
+        this lock could be acquired by another waiter before the current owner
+        executes the first line after the context, which might surprise a user:
+
+        >>>lck = RLock()
+        >>>async def foo():
+        >>>    async with lck:
+        >>>        print('locked')
+        >>>        # since the actual call to lck.release() will be done before
+        >>>        # exiting the context, some other waiter coroutine could be
+        >>>        # scheduled to run before we actually exit the context
+        >>>    print('This line might be executed after'
+        >>>          'another coroutine acquires this lock')
+
+        """
+        if not await current_task() is self._owner:
+            raise RuntimeError('RLock can only be released by the owner')
+        if not self.locked():
+            raise RuntimeError('RLock is not locked')
+        self._count -= 1
+        if self._count == 0:
+            await self._lock.release()
+
+    def locked(self):
+        return self._count > 0
+
 
 class Semaphore(_LockBase):
 
@@ -208,8 +295,8 @@ class _contextadapt(object):
         try:
             await _future_wait(self.enter_future, self.start_evt)
             return self.enter_future.result()
-        except (CancelledError, TaskTimeout):
-            # An interesting corner case... if we're cancelled why waiting to
+        except CancelledError:
+            # An interesting corner case... if we're cancelled while waiting to
             # enter, we'd better arrange to exit in case it eventually succeeds.
             self.exit_future.add_done_callback(lambda f: None)
             self.finish_args = (None, None, None)

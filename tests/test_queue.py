@@ -211,3 +211,106 @@ def test_queue_put_timeout(kernel):
             'producer timeout'
             ]
 
+def test_queue_sync(kernel):
+    results = []
+    async def consumer(queue, label):
+          while True:
+              item = await queue.get()
+              if item is None:
+                  break
+              results.append((label, item))
+              await queue.task_done()
+          await queue.task_done()
+          results.append(label + ' done')
+
+    def produce_item(queue, item):
+        queue.put(item)
+
+    async def producer():
+        queue = Queue()
+        results.append('producer_start')
+        await spawn(consumer(queue, 'cons1'))
+        await spawn(consumer(queue, 'cons2'))
+        await sleep(0.1)
+        for n in range(4):
+            produce_item(queue, n)
+            await sleep(0.1)
+        for n in range(2):
+            produce_item(queue, None)
+        results.append('producer_join')
+        await queue.join()
+        results.append('producer_done')
+
+    kernel.run(producer())
+
+    assert results == [
+            'producer_start',
+            ('cons1', 0),
+            ('cons2', 1),
+            ('cons1', 2),
+            ('cons2', 3),
+            'producer_join',
+            'cons1 done',
+            'producer_done',
+            'cons2 done',
+            ]
+
+
+def test_priority_queue(kernel):
+    results = []
+    priorities = [4, 2, 1, 3]
+
+    async def consumer(queue):
+        while True:
+            item = await queue.get()
+            if item[1] is None:
+                break
+            results.append(item[1])
+            await queue.task_done()
+            await sleep(0.2)
+        await queue.task_done()
+
+    async def producer():
+        queue = PriorityQueue()
+
+        for n in priorities:
+            await queue.put((n, n))
+
+        await queue.put((10, None))
+
+        await spawn(consumer(queue))
+
+        await queue.join()
+
+    kernel.run(producer())
+    assert results == sorted(priorities)
+
+
+def test_lifo_queue(kernel):
+    results = []
+    items = range(4)
+
+    async def consumer(queue):
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            results.append(item)
+            await queue.task_done()
+            await sleep(0.2)
+        await queue.task_done()
+
+    async def producer():
+        queue = LifoQueue()
+
+        await queue.put(None)
+
+        for n in items:
+            await queue.put(n)
+
+        await spawn(consumer(queue))
+
+        await queue.join()
+
+    kernel.run(producer())
+    assert results == list(reversed(items))

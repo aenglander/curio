@@ -34,7 +34,7 @@ def test_wakeat(kernel):
           clock = time.monotonic() + 0.5
           results.append('start')
           newclock = await wake_at(clock)
-          results.append(round(newclock-clock, 2))
+          results.append(round(newclock-clock, 1))
 
     start = time.time()
     kernel.run(main())
@@ -90,6 +90,27 @@ def test_sleep_timeout(kernel):
             'timeout',
             ]
 
+def test_sleep_timeout_absolute(kernel):
+    results = []
+
+    async def sleeper():
+        results.append('start')
+        try:
+            await timeout_at(time.monotonic() + 0.5, sleep(1))
+            results.append('not here')
+        except TaskTimeout:
+            results.append('timeout')
+
+    async def main():
+        task = await spawn(sleeper())
+        await task.join()
+
+    kernel.run(main())
+    assert results == [
+            'start',
+            'timeout',
+            ]
+
 def test_sleep_ignore_timeout(kernel):
     results = []
 
@@ -99,6 +120,34 @@ def test_sleep_ignore_timeout(kernel):
             results.append('timeout')
 
         async with ignore_after(0.5) as s:
+            await sleep(1)
+
+        if s.result is None:
+            results.append('timeout2')
+
+
+    async def main():
+        task = await spawn(sleeper())
+        await task.join()
+
+    kernel.run(main())
+    assert results == [
+            'start',
+            'timeout',
+            'timeout2',
+            ]
+
+
+
+def test_sleep_ignore_timeout_absolute(kernel):
+    results = []
+
+    async def sleeper():
+        results.append('start')
+        if await ignore_at(time.monotonic() + 0.5, sleep(1)) is None:
+            results.append('timeout')
+
+        async with ignore_at(time.monotonic() + 0.5) as s:
             await sleep(1)
 
         if s.result is None:
@@ -429,12 +478,16 @@ def test_nested_timeout(kernel):
         await sleep(1)
         results.append('coro2 done')
 
+    # Parent should cause a timeout before the child.  
+    # Results in a TimeoutCancellationError instead of a normal TaskTimeout
     async def child():
         try:
             await timeout_after(5, coro1())
             results.append('coro1 success')
         except TaskTimeout:
             results.append('coro1 timeout')
+        except TimeoutCancellationError:
+            results.append('coro1 timeout cancel')
 
         await coro2()
         results.append('coro2 success')
@@ -448,9 +501,108 @@ def test_nested_timeout(kernel):
     kernel.run(parent())
     assert results == [
             'coro1 start',
-            'coro1 timeout',
+            'coro1 timeout cancel',
             'coro2 start',
             'parent timeout'
+            ]
+
+
+def test_nested_context_timeout(kernel):
+    results = []
+
+    async def coro1():
+        results.append('coro1 start')
+        await sleep(1)
+        results.append('coro1 done')
+
+    async def coro2():
+        results.append('coro2 start')
+        await sleep(1)
+        results.append('coro2 done')
+
+    # Parent should cause a timeout before the child.  
+    # Results in a TimeoutCancellationError instead of a normal TaskTimeout
+    async def child():
+        try:
+            async with timeout_after(5):
+                await coro1()
+            results.append('coro1 success')
+        except TaskTimeout:
+            results.append('coro1 timeout')
+        except TimeoutCancellationError:
+            results.append('coro1 timeout cancel')
+
+        await coro2()
+        results.append('coro2 success')
+
+    async def parent():
+        try:
+            async with timeout_after(1):
+                await child()
+        except TaskTimeout:
+            results.append('parent timeout')
+
+    kernel.run(parent())
+    assert results == [
+            'coro1 start',
+            'coro1 timeout cancel',
+            'coro2 start',
+            'parent timeout'
+            ]
+
+def test_nested_timeout_uncaught(kernel):
+    results = []
+
+    async def coro1():
+        results.append('coro1 start')
+        await sleep(5)
+        results.append('coro1 done')
+
+    async def child():
+        # This will cause a TaskTimeout, but it's uncaught
+        await timeout_after(1, coro1())
+
+    async def parent():
+        try:
+            await timeout_after(10, child())
+        except TaskTimeout:
+            results.append('parent timeout')
+        except UncaughtTimeoutError:
+            results.append('uncaught timeout')
+
+    kernel.run(parent())
+    assert results == [
+            'coro1 start',
+            'uncaught timeout'
+            ]
+
+
+def test_nested_context_timeout_uncaught(kernel):
+    results = []
+
+    async def coro1():
+        results.append('coro1 start')
+        await sleep(5)
+        results.append('coro1 done')
+
+    async def child():
+        # This will cause a TaskTimeout, but it's uncaught
+        async with timeout_after(1):
+            await coro1()
+
+    async def parent():
+        try:
+            async with timeout_after(10):
+                await child()
+        except TaskTimeout:
+            results.append('parent timeout')
+        except UncaughtTimeoutError:
+            results.append('uncaught timeout')
+
+    kernel.run(parent())
+    assert results == [
+            'coro1 start',
+            'uncaught timeout'
             ]
 
 
@@ -470,7 +622,6 @@ def test_nested_timeout_none(kernel):
     async def child():
         await timeout_after(None, coro1())
         results.append('coro1 success')
-
         await coro2()
         results.append('coro2 success')
 
